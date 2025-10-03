@@ -1,305 +1,17 @@
 use clap::Parser;
-use futures::stream::StreamExt;
-use hickory_resolver::TokioAsyncResolver;
-use libp2p::multiaddr::Protocol;
-use libp2p::{gossipsub, kad, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux};
-use libp2p::{identify, identity, Multiaddr, PeerId, StreamProtocol};
-use serde::{Deserialize, Serialize};
+use env_logger;
+use libp2p::identity;
+use libp2p::Multiaddr;
 use serde_json::json;
-use std::collections::hash_map::DefaultHasher;
-use std::error::Error;
-use std::fs::{self, File};
-use std::hash::{Hash, Hasher};
-use std::io::Write;
+use splash::{Splash, SplashContext, SplashEvent};
 use std::net::SocketAddr;
-use std::str::FromStr;
-use std::time::Duration;
-use tokio::{io, select, time};
-use tracing_subscriber::EnvFilter;
-use warp::http::header;
 use warp::http::StatusCode;
 use warp::Filter;
-
-#[derive(NetworkBehaviour)]
-struct SplashBehaviour {
-    gossipsub: gossipsub::Behaviour,
-    kademlia: kad::Behaviour<kad::store::MemoryStore>,
-    identify: identify::Behaviour,
-}
-
-const MAX_OFFER_SIZE: usize = 300 * 1024;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .try_init();
-
-    let opt = Opt::parse();
-    let (offer_tx, mut offer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
-
-    let id_keys = match opt.identity_file {
-        Some(ref file_path) if fs::metadata(file_path).is_ok() => {
-            load_keypair_from_file(file_path)?
-        }
-        _ => {
-            let keypair = identity::Keypair::generate_ed25519();
-            if let Some(ref file_path) = opt.identity_file {
-                save_keypair_to_file(&keypair, file_path)?;
-            }
-            keypair
-        }
-    };
-
-    let mut known_peers = opt.known_peer.clone();
-
-    if known_peers.is_empty() {
-        println!("No known peers, bootstrapping from dexies dns introducer");
-
-        let resolver = TokioAsyncResolver::tokio_from_system_conf().unwrap();
-        let response = resolver.txt_lookup("_dnsaddr.splash.dexie.space.").await?;
-
-        for record in response.iter() {
-            for txt in record.txt_data() {
-                if let Ok(addr_str) = std::str::from_utf8(txt) {
-                    let addr_str = addr_str.trim_start_matches("dnsaddr="); // Remove "dnsaddr=" prefix
-
-                    if let Ok(peer_multiaddr) = Multiaddr::from_str(addr_str) {
-                        known_peers.push(peer_multiaddr);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys)
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_behaviour(|key| {
-            println!("Our Peer ID: {}", key.public().to_peer_id());
-
-            // We can take the hash of message and use it as an ID.
-            let unique_offer_fn = |message: &gossipsub::Message| {
-                let mut s = DefaultHasher::new();
-                message.data.hash(&mut s);
-                gossipsub::MessageId::from(s.finish().to_string())
-            };
-
-            // Set a custom gossipsub configuration
-            let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(5)) // This is set to aid debugging by not cluttering the log space
-                .message_id_fn(unique_offer_fn) // No duplicate offers will be propagated.
-                .max_transmit_size(MAX_OFFER_SIZE)
-                .build()
-                .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?; // Temporary hack because `build` does not return a proper `std::error::Error`.
-
-            // build a gossipsub network behaviour
-            let gossipsub = gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(key.clone()),
-                gossipsub_config,
-            )?;
-
-            // Create a Kademlia behaviour.
-            let mut cfg = kad::Config::default();
-
-            cfg.set_protocol_names(vec![StreamProtocol::try_from_owned(
-                "/splash/kad/1".to_string(),
-            )?]);
-
-            cfg.set_query_timeout(Duration::from_secs(60));
-            let store = kad::store::MemoryStore::new(key.public().to_peer_id());
-
-            let mut kademlia = kad::Behaviour::with_config(key.public().to_peer_id(), store, cfg);
-
-            for addr in known_peers.iter() {
-                let Some(Protocol::P2p(peer_id)) = addr.iter().last() else {
-                    return Err("Expect peer multiaddr to contain peer ID.".into());
-                };
-                kademlia.add_address(&peer_id, addr.clone());
-            }
-
-            kademlia.bootstrap().unwrap();
-
-            let identify = identify::Behaviour::new(identify::Config::new(
-                "/splash/id/1".into(),
-                key.public().clone(),
-            ));
-
-            Ok(SplashBehaviour {
-                gossipsub,
-                kademlia,
-                identify,
-            })
-        })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-        .build();
-
-    if !opt.listen_address.is_empty() {
-        for addr in opt.listen_address.iter() {
-            swarm.listen_on(addr.clone())?;
-        }
-    } else {
-        // Fallback to default addresses if no listen addresses are provided
-        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-        swarm.listen_on("/ip6/::/tcp/0".parse()?)?;
-    }
-
-    // Create a Gossipsub topic
-    let topic = gossipsub::IdentTopic::new("/splash/offers/1");
-
-    // subscribes to our topic
-    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
-
-    let offer_tx_clone = offer_tx.clone();
-
-    let offer_route = warp::post()
-        .and(warp::body::json())
-        .map(move |offer: serde_json::Value| {
-            let response = match offer.get("offer").and_then(|v| v.as_str()) {
-                Some(offer_str) if offer_str.as_bytes().len() > MAX_OFFER_SIZE => {
-                    warp::reply::with_status(
-                        warp::reply::json(&json!({
-                            "success": false,
-                            "error": "Offer too large"
-                        })),
-                        StatusCode::BAD_REQUEST,
-                    )
-                }
-                Some(offer_str) if bech32::decode(offer_str).is_ok() => {
-                    let offer_bytes = offer_str.as_bytes().to_vec();
-                    let tx = offer_tx_clone.clone();
-                    tokio::spawn(async move {
-                        if tx.send(offer_bytes).await.is_err() {
-                            eprintln!("Failed to send offer through the channel");
-                        }
-                    });
-                    warp::reply::with_status(
-                        warp::reply::json(&json!({
-                            "success": true,
-                        })),
-                        StatusCode::OK,
-                    )
-                }
-                _ => warp::reply::with_status(
-                    warp::reply::json(&json!({
-                        "success": false,
-                        "error": "Invalid offer format"
-                    })),
-                    StatusCode::BAD_REQUEST,
-                ),
-            };
-
-            warp::reply::with_header(response, header::CONTENT_TYPE, "application/json")
-        });
-
-    // Start the warp server using the address provided in the `listen_offer_submission` option.
-    if let Some(submission_addr_str) = opt.listen_offer_submission {
-        let submission_addr: SocketAddr =
-            submission_addr_str.parse().expect("Invalid socket address");
-        tokio::spawn(async move {
-            warp::serve(offer_route).run(submission_addr).await;
-        });
-    }
-
-    let mut peer_discovery_interval = time::interval(time::Duration::from_secs(10));
-
-    loop {
-        select! {
-            Some(offer) = offer_rx.recv() => {
-                println!("Broadcasting Offer: {}", String::from_utf8_lossy(&offer));
-
-                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), offer) {
-                    eprintln!("Broadcasting offer failed: {}", e);
-                }
-            },
-            _ = peer_discovery_interval.tick() => {
-                swarm.behaviour_mut().kademlia.get_closest_peers(PeerId::random());
-            },
-            event = swarm.select_next_some() => match event {
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    println!("Connected to peer: {peer_id}");
-                },
-                SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                    println!("Disconnected from peer: {peer_id}");
-                },
-                SwarmEvent::Behaviour(SplashBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                    propagation_source: _,
-                    message_id: _,
-                    message,
-                })) => {
-                    let data_clone = message.data.clone();
-                    let msg_str = String::from_utf8_lossy(&data_clone).into_owned();
-
-                    if msg_str.starts_with("offer1") {
-                        println!(
-                            "Received Offer: {}",
-                            msg_str,
-                        );
-
-                        if let Some(ref endpoint_url) = opt.offer_hook {
-                            let endpoint_url_clone = endpoint_url.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = offer_post_hook(&endpoint_url_clone, &msg_str).await {
-                                    eprintln!("Error posting to offer hook: {}", e);
-                                }
-                            });
-                        }
-                    }
-                },
-                SwarmEvent::Behaviour(SplashBehaviourEvent::Identify(identify::Event::Received { info: identify::Info { observed_addr, listen_addrs, .. }, peer_id })) => {
-                    for addr in listen_addrs {
-                        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                    }
-                    // Mark the address observed for us by the external peer as confirmed.
-                    // TODO: We shouldn't trust this, instead we should confirm our own address manually or using
-                    // `libp2p-autonat`.
-                    swarm.add_external_address(observed_addr);
-                },
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    println!("Listening on: {address}");
-                },
-                _ => {}
-            }
-        }
-    }
-}
-
-async fn offer_post_hook(endpoint: &str, offer: &str) -> Result<(), reqwest::Error> {
-    let client = reqwest::Client::new();
-
-    let offer_json = json!({ "offer": offer });
-    client.post(endpoint).json(&offer_json).send().await?;
-
-    Ok(())
-}
-
-fn save_keypair_to_file(keypair: &identity::Keypair, file_path: &str) -> io::Result<()> {
-    let encoded = keypair.to_protobuf_encoding().unwrap();
-    let keypair_json: IdentityJson = IdentityJson { identity: encoded };
-    let json = serde_json::to_string(&keypair_json)?;
-    let mut file = File::create(file_path)?;
-    file.write_all(json.as_bytes())?;
-    Ok(())
-}
-
-fn load_keypair_from_file(file_path: &str) -> io::Result<identity::Keypair> {
-    let contents = fs::read_to_string(file_path)?;
-    let keypair_json: IdentityJson = serde_json::from_str(&contents)?;
-    identity::Keypair::from_protobuf_encoding(&keypair_json.identity)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid keypair data"))
-}
-
-#[derive(Serialize, Deserialize)]
-struct IdentityJson {
-    identity: Vec<u8>,
-}
+mod metrics;
+mod utils;
 
 #[derive(Parser, Debug)]
-#[clap(name = "Splash!")]
+#[clap(name = "Splash!", version = env!("CARGO_PKG_VERSION"))]
 struct Opt {
     #[clap(
         long,
@@ -324,9 +36,12 @@ struct Opt {
     )]
     identity_file: Option<String>,
 
+    #[clap(long, short, help = "Use Testnet")]
+    testnet: bool,
+
     #[clap(
         long,
-        help = "HTTP endpoint where incoming offers are posted to, sends JSON body {\"offer\":\"offer1...\"} (defaults to STDOUT)"
+        help = "HTTP endpoint where incoming offers are posted to, sends JSON body {\"offer\":\"offer1...\"}"
     )]
     offer_hook: Option<String>,
 
@@ -336,4 +51,134 @@ struct Opt {
         value_name = "HOST:PORT"
     )]
     listen_offer_submission: Option<String>,
+
+    #[clap(long, help = "Start a HTTP API for metrics", value_name = "HOST:PORT")]
+    listen_metrics: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+
+    let opt = Opt::parse();
+
+    println!("Welcome to Splash! v{}", env!("CARGO_PKG_VERSION"));
+
+    let mut splash = Splash::new()
+        .with_listen_addresses(opt.listen_address)
+        .with_known_peers(opt.known_peer);
+
+    // Load or generate peer identity (keypair), only if --identity-file is specified
+    if let Some(keypair) = opt.identity_file.as_ref().map(|file_path| {
+        utils::load_keypair_from_file(file_path).unwrap_or_else(|_| {
+            let keypair = identity::Keypair::generate_ed25519();
+            utils::save_keypair_to_file(&keypair, file_path).ok();
+            keypair
+        })
+    }) {
+        splash = splash.with_keys(keypair);
+    }
+
+    if opt.testnet {
+        println!("Using Testnet");
+        splash = splash.with_testnet();
+    }
+
+    let SplashContext { node, mut events } = splash.build().await?;
+
+    let metrics = metrics::Metrics::new();
+
+    // Start a local webserver for offer submission, only if --listen-offer-submission is specified
+    if let Some(offer_submission_addr_str) = opt.listen_offer_submission {
+        let offer_route =
+            warp::post()
+                .and(warp::body::json())
+                .and_then(move |offer: serde_json::Value| {
+                    let node = node.clone();
+                    async move {
+                        let response =
+                            if let Some(offer_str) = offer.get("offer").and_then(|v| v.as_str()) {
+                                match node.broadcast_offer(offer_str).await {
+                                    Ok(_) => warp::reply::json(&json!({"success": true})),
+                                    Err(e) => warp::reply::json(&json!({
+                                        "success": false,
+                                        "error": e.to_string(),
+                                    })),
+                                }
+                            } else {
+                                warp::reply::json(&json!({
+                                    "success": false,
+                                    "error": "Invalid offer format",
+                                }))
+                            };
+
+                        Ok::<_, warp::Rejection>(warp::reply::with_status(response, StatusCode::OK))
+                    }
+                });
+
+        let submission_addr: SocketAddr = offer_submission_addr_str.parse()?;
+
+        tokio::spawn(async move {
+            warp::serve(offer_route).run(submission_addr).await;
+        });
+    }
+
+    // Start a local webserver for splash metrics, only if --listen-metrics is specified
+    if let Some(listen_metrics_str) = opt.listen_metrics {
+        let metrics_address: SocketAddr = listen_metrics_str.parse()?;
+
+        let metrics = metrics.clone();
+        let metrics_route = warp::get().map(move || {
+            let metrics_data = metrics.get_metrics();
+            warp::reply::json(&metrics_data)
+        });
+
+        tokio::spawn(async move {
+            warp::serve(metrics_route).run(metrics_address).await;
+        });
+    }
+
+    // Process the received events
+    while let Some(event) = events.recv().await {
+        match event {
+            SplashEvent::Initialized(peer_id) => println!("Our Peer ID: {}", peer_id),
+
+            SplashEvent::NewListenAddress(address) => println!("Listening on: {}", address),
+
+            SplashEvent::PeerConnected(peer_id) => {
+                let peers = metrics.increment_peers();
+                println!("Connected to peer: {} (peers: {})", peer_id, peers);
+            }
+
+            SplashEvent::PeerDisconnected(peer_id) => {
+                let peers = metrics.decrement_peers();
+                println!("Disconnected from peer: {} (peers: {})", peer_id, peers);
+            }
+
+            SplashEvent::OfferBroadcasted(offer) => {
+                println!("Broadcasted Offer: {}", offer);
+                metrics.increment_offers_broadcasted();
+            }
+
+            SplashEvent::OfferBroadcastFailed(err) => {
+                println!("Broadcasting Offer failed: {}", err)
+            }
+
+            SplashEvent::OfferReceived(offer) => {
+                println!("Received Offer: {}", offer);
+                metrics.increment_offers_received();
+
+                if let Some(ref endpoint_url) = opt.offer_hook {
+                    let endpoint_url_clone = endpoint_url.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = utils::offer_post_hook(&endpoint_url_clone, &offer).await {
+                            eprintln!("Error posting to offer hook: {}", e);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
